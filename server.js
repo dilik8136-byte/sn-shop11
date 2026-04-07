@@ -17,6 +17,10 @@ const STORAGE_MODE = String(process.env.STORAGE_MODE || 'supabase').trim().toLow
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || 'sn-shop';
+const OWNER_USERNAMES = (process.env.OWNER_USERNAMES || '')
+  .split(',')
+  .map((v) => v.trim().replace(/^@/, ''))
+  .filter(Boolean);
 const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || '')
   .split(',')
   .map((v) => v.trim().replace(/^@/, ''))
@@ -119,8 +123,11 @@ ensureDataFile();
 function normalizeUsername(raw) {
   return String(raw || '').trim().replace(/^@/, '');
 }
+function isOwner(username) {
+  return OWNER_USERNAMES.includes(normalizeUsername(username));
+}
 function isAdmin(username) {
-  return ADMIN_USERNAMES.includes(normalizeUsername(username));
+  return isOwner(username) || ADMIN_USERNAMES.includes(normalizeUsername(username));
 }
 function slugify(value) {
   const base = String(value || '').trim().toLowerCase()
@@ -161,19 +168,115 @@ async function readData() {
 async function writeData(data) {
   await fsp.writeFile(dataFile, JSON.stringify(hydrateData(data), null, 2), 'utf8');
 }
+
+async function getDbRoleRows(role) {
+  if (!supabaseEnabled) return [];
+  try {
+    const { data, error } = await supabase
+      .from('user_roles')
+      .select('username, role, created_at')
+      .eq('role', role);
+    if (error) {
+      console.error('Role DB read error:', error.message);
+      return [];
+    }
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.error('Role DB read crash:', err.message);
+    return [];
+  }
+}
+
+async function upsertRoleDb(role, username) {
+  if (!supabaseEnabled) return false;
+  try {
+    const { error } = await supabase
+      .from('user_roles')
+      .upsert(
+        { username: normalizeUsername(username), role },
+        { onConflict: 'username,role', ignoreDuplicates: false }
+      );
+    if (error) {
+      console.error('Role DB upsert error:', error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Role DB upsert crash:', err.message);
+    return false;
+  }
+}
+
+async function removeRoleDb(role, username) {
+  if (!supabaseEnabled) return false;
+  try {
+    const { error } = await supabase
+      .from('user_roles')
+      .delete()
+      .eq('username', normalizeUsername(username))
+      .eq('role', role);
+    if (error) {
+      console.error('Role DB delete error:', error.message);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Role DB delete crash:', err.message);
+    return false;
+  }
+}
+
+async function listSellers() {
+  const data = await readData();
+  const local = Array.isArray(data.sellers) ? data.sellers : [];
+  const map = new Map(local.map((item) => [normalizeUsername(item.username), item]));
+  const dbRows = await getDbRoleRows('seller');
+  for (const row of dbRows) {
+    const username = normalizeUsername(row.username);
+    if (!username) continue;
+    if (!map.has(username)) {
+      map.set(username, {
+        username,
+        displayName: username,
+        createdAt: row.created_at || new Date().toISOString()
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
+async function listSupportAgents() {
+  const data = await readData();
+  const local = Array.isArray(data.supportAgents) ? data.supportAgents : [];
+  const map = new Map(local.map((item) => [normalizeUsername(item.username), item]));
+  const dbRows = await getDbRoleRows('support');
+  for (const row of dbRows) {
+    const username = normalizeUsername(row.username);
+    if (!username) continue;
+    if (!map.has(username)) {
+      map.set(username, {
+        username,
+        displayName: username,
+        createdAt: row.created_at || new Date().toISOString()
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
 async function isSeller(username) {
   const u = normalizeUsername(username);
   if (!u) return false;
   if (isAdmin(u)) return true;
-  const data = await readData();
-  return data.sellers.some((seller) => normalizeUsername(seller.username) === u);
+  const sellers = await listSellers();
+  return sellers.some((seller) => normalizeUsername(seller.username) === u);
 }
 async function isSupport(username) {
   const u = normalizeUsername(username);
   if (!u) return false;
   if (isAdmin(u)) return true;
-  const data = await readData();
-  return data.supportAgents.some((agent) => normalizeUsername(agent.username) === u);
+  const agents = await listSupportAgents();
+  return agents.some((agent) => normalizeUsername(agent.username) === u);
 }
 function supportMessageSummary(ticket) {
   return [
@@ -203,7 +306,8 @@ const upload = multer({
 async function uploadSingleToSupabase(file) {
   const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
   const objectPath = `products/${Date.now()}-${crypto.randomUUID().slice(0, 8)}${ext}`;
-  const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(objectPath, file.buffer, {
+  const input = file.buffer || await fsp.readFile(file.path);
+  const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(objectPath, input, {
     contentType: file.mimetype || 'image/jpeg',
     upsert: false,
     cacheControl: '3600'
@@ -214,16 +318,26 @@ async function uploadSingleToSupabase(file) {
 }
 async function persistUploadedImages(files = []) {
   if (!files.length) return [];
-  if (supabaseEnabled) return Promise.all(files.map((file) => uploadSingleToSupabase(file)));
-  return files.map((file) => `/uploads/${file.filename}`);
+  try {
+    if (supabaseEnabled) {
+      const urls = await Promise.all(files.map((file) => uploadSingleToSupabase(file)));
+      return urls.filter(Boolean);
+    }
+    return files.map((file) => `/uploads/${file.filename}`);
+  } finally {
+    await Promise.all(files.map(async (file) => {
+      if (file.path) {
+        try { await fsp.unlink(file.path); } catch (_err) {}
+      }
+    }));
+  }
 }
 
 let supportBotInstance = null;
 let mainBotInstance = null;
 async function notifySupportAgents(ticket) {
   if (!supportBotInstance) return;
-  const data = await readData();
-  const agents = data.supportAgents.filter((agent) => agent.chatId);
+  const agents = (await listSupportAgents()).filter((agent) => agent.chatId);
   for (const agent of agents) {
     try {
       await supportBotInstance.telegram.sendMessage(agent.chatId, supportMessageSummary(ticket), Markup.inlineKeyboard([
@@ -301,7 +415,12 @@ app.get('/api/store/:store/product/:slug', async (req, res) => {
 });
 app.get('/api/roles/:username', async (req, res) => {
   const username = normalizeUsername(req.params.username);
-  res.json({ isAdmin: isAdmin(username), isSeller: await isSeller(username), isSupport: await isSupport(username) });
+  res.json({
+    isOwner: isOwner(username),
+    isAdmin: isAdmin(username),
+    isSeller: await isSeller(username),
+    isSupport: await isSupport(username)
+  });
 });
 app.get('/api/seller/:username', async (req, res) => {
   const username = normalizeUsername(req.params.username);
@@ -314,10 +433,11 @@ app.get('/api/seller/:username', async (req, res) => {
 app.get('/api/admin/roles', async (req, res) => {
   const by = normalizeUsername(req.query.by);
   if (!isAdmin(by)) return res.status(403).json({ error: 'Нет доступа' });
-  const data = await readData();
+  const sellers = await listSellers();
+  const support = await listSupportAgents();
   res.json({
-    sellers: data.sellers.map((item) => ({ username: item.username, displayName: item.displayName || item.username, chatId: item.chatId || null })),
-    support: data.supportAgents.map((item) => ({ username: item.username, displayName: item.displayName || item.username, chatId: item.chatId || null }))
+    sellers: sellers.map((item) => ({ username: item.username, displayName: item.displayName || item.username, chatId: item.chatId || null })),
+    support: support.map((item) => ({ username: item.username, displayName: item.displayName || item.username, chatId: item.chatId || null }))
   });
 });
 app.post('/api/admin/roles', async (req, res) => {
@@ -326,10 +446,8 @@ app.post('/api/admin/roles', async (req, res) => {
   const role = String(req.body.role || '').trim().toLowerCase();
   if (!isAdmin(by)) return res.status(403).json({ error: 'Нет доступа' });
   if (!target || !['seller', 'support'].includes(role)) return res.status(400).json({ error: 'Неверные данные' });
-  const data = await readData();
-  const list = role === 'support' ? data.supportAgents : data.sellers;
-  if (!list.some((item) => normalizeUsername(item.username) === target)) list.push({ username: target, displayName: target, createdAt: new Date().toISOString() });
-  await writeData(data);
+
+  await upsertRole(role, target);
   res.json({ ok: true });
 });
 app.delete('/api/admin/roles', async (req, res) => {
@@ -338,10 +456,8 @@ app.delete('/api/admin/roles', async (req, res) => {
   const role = String(req.query.role || '').trim().toLowerCase();
   if (!isAdmin(by)) return res.status(403).json({ error: 'Нет доступа' });
   if (!target || !['seller', 'support'].includes(role)) return res.status(400).json({ error: 'Неверные данные' });
-  const data = await readData();
-  if (role === 'support') data.supportAgents = data.supportAgents.filter((item) => normalizeUsername(item.username) !== target);
-  else data.sellers = data.sellers.filter((item) => normalizeUsername(item.username) !== target);
-  await writeData(data);
+
+  await removeRole(role, target);
   res.json({ ok: true });
 });
 app.post('/api/categories', async (req, res) => {
@@ -535,15 +651,25 @@ if (BOT_TOKEN) {
   mainBotInstance = bot;
   const adminPending = new Map();
   async function upsertRole(listName, username) {
+    const clean = normalizeUsername(username);
+    if (!clean) return;
+    await upsertRoleDb(listName, clean);
+
     const data = await readData();
     const list = listName === 'support' ? data.supportAgents : data.sellers;
-    if (!list.some((item) => normalizeUsername(item.username) === username)) list.push({ username, displayName: username, createdAt: new Date().toISOString() });
-    await writeData(data);
+    if (!list.some((item) => normalizeUsername(item.username) === clean)) {
+      list.push({ username: clean, displayName: clean, createdAt: new Date().toISOString() });
+      await writeData(data);
+    }
   }
   async function removeRole(listName, username) {
+    const clean = normalizeUsername(username);
+    if (!clean) return;
+    await removeRoleDb(listName, clean);
+
     const data = await readData();
-    if (listName === 'support') data.supportAgents = data.supportAgents.filter((item) => normalizeUsername(item.username) !== username);
-    else data.sellers = data.sellers.filter((item) => normalizeUsername(item.username) !== username);
+    if (listName === 'support') data.supportAgents = data.supportAgents.filter((item) => normalizeUsername(item.username) !== clean);
+    else data.sellers = data.sellers.filter((item) => normalizeUsername(item.username) !== clean);
     await writeData(data);
   }
   bot.start(async (ctx) => {
@@ -667,9 +793,15 @@ if (SUPPORT_BOT_TOKEN) {
   supportBotInstance = supportBot;
   supportBot.start(async (ctx) => {
     const uname = normalizeUsername(ctx.from?.username);
+    const supportAgents = await listSupportAgents();
+    const hasSupportRole = supportAgents.some((item) => normalizeUsername(item.username) === uname);
+    if (!hasSupportRole) return ctx.reply('У тебя нет роли техподдержки. Сначала выдай её через основной бот.');
     const data = await readData();
-    const record = data.supportAgents.find((item) => normalizeUsername(item.username) === uname);
-    if (!record) return ctx.reply('У тебя нет роли техподдержки. Сначала выдай её через основной бот.');
+    let record = data.supportAgents.find((item) => normalizeUsername(item.username) === uname);
+    if (!record) {
+      record = { username: uname, displayName: uname, createdAt: new Date().toISOString() };
+      data.supportAgents.push(record);
+    }
     record.chatId = ctx.chat.id;
     await writeData(data);
     await ctx.reply('Support-бот подключён. Новые анкеты будут приходить сюда.', Markup.inlineKeyboard([
